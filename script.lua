@@ -7612,7 +7612,7 @@ local function _stages(toPos)
     return st
 end
 
-local function _routeClear(pts)
+function _routeClear(pts)
     for i = 1, #pts - 1 do
         if not _clear(pts[i], pts[i + 1]) then return false end
     end
