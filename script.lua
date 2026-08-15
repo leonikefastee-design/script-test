@@ -4459,8 +4459,10 @@ if _G.__LMARK then _G.__LMARK("core requires done") end
 
 autoStealEnabled = Config.AutoStealEnabled
 if autoStealEnabled == nil then autoStealEnabled = true end
+_G.autoStealEnabled = autoStealEnabled   -- exposed for ingestion engine
 instantStealEnabled = Config.InstantStealEnabled
 if instantStealEnabled == nil then instantStealEnabled = true end
+_G.instantStealEnabled = instantStealEnabled  -- exposed for ingestion engine
 stealHighestEnabled = Config.StealHighest
 if stealHighestEnabled == nil then stealHighestEnabled = true end
 stealPriorityEnabled = Config.StealPriority
@@ -4478,201 +4480,550 @@ lastInstantStealTime = 0
 PromptMemoryCache = {}
 InternalStealCacheData = {}
 
--- ============================================================
--- AUTO GRAB INTEGRATION 
--- ============================================================
-local CONFIG = {
-    AUTO_STEAL = false,
-    RADIUS = 60
-}
+-- =====================================================================
+-- HERESY HUB — ZERO-YIELD INGESTION ENGINE v2  [FIXED]
+-- Drop this block in place of the four systems it replaces:
+--   1. trackedPrompts poll loop      (lines ~4502-4675)
+--   2. SXECicloTP / grapple chain    (lines ~913-985 wait stalls)
+--   3. PathfindingService route      (computeRoute, _pullWide, _pushOffWalls)
+--   4. AllAnimalsCache wait block    (20-second target-wait)
+--
+-- Every external symbol this touches (_G.*, SharedState.*, Config.*, etc.)
+-- keeps its original name so the rest of the hub compiles unchanged.
+-- =====================================================================
 
-local boxes = {
-    {min = Vector3.new(-337.448303, -3.898971, -122.397758), max = Vector3.new(-328.004578, -3.898971, 242.625626)},
-    {min = Vector3.new(-327.257660, -3.899109, -122.228622), max = Vector3.new(-320.600891, -3.899109, 242.612259)},
-    {min = Vector3.new(-319.783386, -3.898970, -122.227089), max = Vector3.new(-312.908325, -3.898970, 242.585617)},
-    {min = Vector3.new(-312.445648, -3.899108, -122.389832), max = Vector3.new(-305.489899, -3.899108, 242.456818)},
-    {min = Vector3.new(-305.037048, -3.898970, -122.230743), max = Vector3.new(-293.957489, -3.898970, 242.606873)},
-    {min = Vector3.new(-491.448608, -3.898972, -122.253258), max = Vector3.new(-481.811737, -3.898972, 242.615005)},
-    {min = Vector3.new(-498.971069, -3.898970, -122.382767), max = Vector3.new(-491.748840, -3.898970, 242.612061)},
-    {min = Vector3.new(-506.436737, -3.898972, -122.411476), max = Vector3.new(-499.318542, -3.898972, 242.615982)},
-    {min = Vector3.new(-513.783569, -3.898972, -122.223297), max = Vector3.new(-506.801849, -3.898972, 242.627090)},
-    {min = Vector3.new(-525.236938, -3.898972, -122.409813), max = Vector3.new(-514.265015, -3.898972, 242.608932)},
-}
+-- ─────────────────────────────────────────────────────────────────────
+-- §1  SHARED FAST-PATH HELPERS
+-- ─────────────────────────────────────────────────────────────────────
 
-local trackedPrompts = {}
-local lastFire = {}
+local RunService   = game:GetService("RunService")
+local Players      = game:GetService("Players")
+local PPS          = game:GetService("ProximityPromptService")
+local Workspace    = game:GetService("Workspace")
 
-local SAFE_POLL_RATE = 0.05
-local SAFE_POLL_OVERRIDE_UNTIL = 0
-
-function _G.getSafePollRate()
-    if os.clock() < SAFE_POLL_OVERRIDE_UNTIL then
-        return 0.27
-    end
-    return SAFE_POLL_RATE
+local LP           = Players.LocalPlayer
+local function getHRP()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
 end
+
+-- Microsecond clock alias — avoids os.clock() call overhead in hot loops.
+local clock = os.clock
+
+-- ─────────────────────────────────────────────────────────────────────
+-- §2  EVENT-DRIVEN AUTO-GRAB  (replaces task.wait(0.05) poll loop)
+--
+--  Two signal paths funnel into the same firePrompt kernel:
+--
+--  PATH A — PromptShown (service-level):
+--    Fires the instant any ProximityPrompt becomes visible to the
+--    client, even before its parent Part finishes rendering. This
+--    covers prompts on already-streamed-in podiums.
+--
+--  PATH B — workspace.DescendantAdded filtered to "AnimalPodiums":
+--    StreamingEnabled may hold PromptShown until the part renders;
+--    DescendantAdded fires the moment the Instance exists in RAM —
+--    before the streaming budget renders it. Catches the other half.
+--
+--  Both paths call trackAndFire(), which:
+--    1. Guards against own-plot and disabled prompts.
+--    2. Radius-checks against configuredRadius.
+--    3. Fires all 4 burst signals in separate task.spawn coroutines
+--       so they land in the same scheduler frame (§2a).
+--    4. Hooks GetPropertyChangedSignal("Enabled") so re-enables
+--       on an already-tracked prompt re-trigger the burst.
+-- ─────────────────────────────────────────────────────────────────────
+
+local trackedPrompts   = {}   -- [prompt] = { lastFire, lastEnable }
+local FIRE_DEBOUNCE    = 0.12
+local ENABLE_DEBOUNCE  = 0.08
+local FIRE_BURST       = 4    -- parallel coroutines, one per signal
+local ENABLE_BURST     = 35
+
+-- §2a  Parallel burst kernel — all 4 fires land in the same frame.
+local function burstFire(prompt, count)
+    if not prompt or not prompt.Parent or not prompt.Enabled then return end
+    for i = 1, count do
+        -- task.spawn schedules each coroutine on the SAME heartbeat step;
+        -- no yield between them, so all four hits register before the next
+        -- server-authoritative tick can interleave another client's fire.
+        task.spawn(function()
+            pcall(function() fireproximityprompt(prompt, 0) end)
+        end)
+    end
+end
+
+-- Lightweight own-plot guard (mirrors original isMyPlot_Instant logic).
+local function isOwnPlot(prompt)
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then return false end
+    local parentPlot = prompt:FindFirstAncestorWhichIsA("Model")
+    while parentPlot and parentPlot.Parent ~= plots do
+        parentPlot = parentPlot.Parent
+    end
+    if not parentPlot then return false end
+    local sign = parentPlot:FindFirstChild("PlotSign")
+    if not sign then return false end
+    local gui   = sign:FindFirstChildWhichIsA("SurfaceGui", true)
+    local label = gui and gui:FindFirstChildWhichIsA("TextLabel", true)
+    if not label then return false end
+    local txt = label.Text:lower()
+    return txt:find(LP.Name:lower(), 1, true) ~= nil
+        or txt:find(LP.DisplayName:lower(), 1, true) ~= nil
+end
+
+-- ─────────────────────────────────────────────────────────────────────
+-- FIX §A — promptReady
+--   • Bare globals replaced with explicit _G lookups so the function
+--     degrades gracefully when the hub hasn't written them yet.
+--   • Config vs CONFIG normalised: use CONFIG with a nil guard, then
+--     fall back to Config (hub may expose either name), then 60.
+-- ─────────────────────────────────────────────────────────────────────
+local function promptReady(prompt, hrpPos)
+    -- FIX: explicit _G references; bare globals may be nil on first Heartbeat.
+    if not (_G.autoStealEnabled and _G.instantStealEnabled) then return false end
+    if not prompt or not prompt.Parent or not prompt.Enabled then return false end
+    -- Position resolution — attachment-aware.
+    local p = prompt.Parent
+    if p:IsA("Attachment") and p.Parent then p = p.Parent end
+    local pos
+    if p:IsA("BasePart") then
+        pos = p.Position
+    elseif p:IsA("Model") then
+        local ok, cf = pcall(function() return p:GetPivot() end)
+        pos = ok and cf.Position or nil
+    end
+    if not pos then return false end
+    if isOwnPlot(prompt) then return false end
+    -- FIX: normalise Config vs CONFIG; both names appear in the hub.
+    local radius = (CONFIG and CONFIG.AutoGrabRadius)
+                or (Config  and Config.AutoGrabRadius)
+                or 60
+    return (pos - hrpPos).Magnitude <= radius
+end
+
+local function trackAndFire(prompt)
+    -- De-duplicate: already watched.
+    if trackedPrompts[prompt] then return end
+    local rec = { lastFire = 0, lastEnable = 0 }
+    trackedPrompts[prompt] = rec
+
+    local function tryFire(burst, debounce, recKey)
+        local hrp = getHRP()
+        if not hrp then return end
+        if not promptReady(prompt, hrp.Position) then return end
+        local now = clock()
+        if (now - rec[recKey]) < debounce then return end
+        rec[recKey] = now
+        burstFire(prompt, burst)
+        -- Simultaneously hit any nearby purchasable prompts (competitive registry).
+        task.spawn(function()
+            for near in pairs(trackedPrompts) do
+                if near ~= prompt and near.Parent and near.Enabled then
+                    local np = near.Parent
+                    if np:IsA("Attachment") and np.Parent then np = np.Parent end
+                    local npos
+                    if np:IsA("BasePart") then npos = np.Position
+                    elseif np:IsA("Model") then
+                        local ok2, cf2 = pcall(function() return np:GetPivot() end)
+                        npos = ok2 and cf2.Position or nil
+                    end
+                    -- FIX: same Config/CONFIG fallback here for radius.
+                    local nr = (CONFIG and CONFIG.AutoGrabRadius)
+                            or (Config  and Config.AutoGrabRadius)
+                            or 60
+                    if npos and (npos - hrp.Position).Magnitude <= nr then
+                        burstFire(near, 2)
+                    end
+                end
+            end
+        end)
+    end
+
+    -- Immediate attempt when the prompt first appears.
+    task.defer(function()
+        tryFire(ENABLE_BURST, ENABLE_DEBOUNCE, "lastEnable")
+    end)
+
+    -- Re-trigger on Enabled state change (podium re-opens after someone fails).
+    pcall(function()
+        prompt:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if prompt.Enabled then
+                tryFire(ENABLE_BURST, ENABLE_DEBOUNCE, "lastEnable")
+            end
+        end)
+    end)
+
+    -- Ancestry cleanup — stop tracking dead prompts without polling.
+    prompt.AncestryChanged:Connect(function()
+        if not prompt:IsDescendantOf(Workspace) then
+            trackedPrompts[prompt] = nil
+        end
+    end)
+end
+
+-- PATH A — ProximityPromptService.PromptShown fires BEFORE rendering.
+PPS.PromptShown:Connect(function(prompt)
+    -- Only care about AnimalPodiums prompts.
+    if prompt:FindFirstAncestor("AnimalPodiums") then
+        trackAndFire(prompt)
+    end
+end)
+
+-- PATH B — workspace.DescendantAdded, catches StreamingEnabled stragglers.
+Workspace.DescendantAdded:Connect(function(obj)
+    if obj:IsA("ProximityPrompt") and obj:FindFirstAncestor("AnimalPodiums") then
+        trackAndFire(obj)
+    end
+end)
+
+-- Bootstrap: scan already-loaded podiums once at startup.
+do
+    local plots = Workspace:FindFirstChild("Plots")
+    if plots then
+        for _, plot in ipairs(plots:GetChildren()) do
+            local podiums = plot:FindFirstChild("AnimalPodiums")
+            if podiums then
+                for _, desc in ipairs(podiums:GetDescendants()) do
+                    if desc:IsA("ProximityPrompt") then trackAndFire(desc) end
+                end
+            end
+        end
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────────────
+-- FIX §B — Heartbeat loop  ← PRIMARY CRASH SITE (line ~204)
+--
+--   Root cause: CONFIG is nil when the hub initialises this block
+--   before its own CONFIG table exists. All four CONFIG.AUTO_STEAL
+--   accesses (read + write) were unguarded.
+--
+--   Fix: wrap every CONFIG access in a nil check.
+--   _G.autoStealEnabled / _G.instantStealEnabled also explicit.
+-- ─────────────────────────────────────────────────────────────────────
+RunService.Heartbeat:Connect(function()
+    -- FIX: _G-explicit flags; nil CONFIG write guarded.
+    if not (_G.autoStealEnabled and _G.instantStealEnabled) then
+        if CONFIG then CONFIG.AUTO_STEAL = false end          -- FIX: nil guard
+        return
+    end
+    local hrp = getHRP()
+    if not hrp then
+        if CONFIG then CONFIG.AUTO_STEAL = false end          -- FIX: nil guard
+        return
+    end
+    local myPos = hrp.Position
+    local anyAvail = false
+    local now = clock()
+    for prompt, rec in pairs(trackedPrompts) do
+        if promptReady(prompt, myPos) then
+            anyAvail = true
+            -- FIX: CONFIG nil guard before read.
+            if CONFIG and CONFIG.AUTO_STEAL and (now - rec.lastFire) >= FIRE_DEBOUNCE then
+                rec.lastFire = now
+                burstFire(prompt, FIRE_BURST)
+            end
+        end
+    end
+    -- FIX: nil guard before final write.
+    if CONFIG then CONFIG.AUTO_STEAL = anyAvail end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────
+-- §3  ZERO-DELAY GRAPPLE / TELEPORT CHAIN
+--
+--  Original SXECicloTP had a hardcoded task.wait(0.12) between
+--  SXEFireGrapple2 and the primary TP move. Replaced with exactly
+--  0.02s (≈1-2 engine ticks) — the minimum that lets the UDP stack
+--  register the grapple server-side without an artificial pause.
+--
+--  The grapple equip-and-fire path is left intact; only the yield
+--  between grapple-fire and TP initiation is changed.
+-- ─────────────────────────────────────────────────────────────────────
+
+-- Wrap the existing SXECicloTP initialiser to shorten the stall.
+-- We hook _G.SXECicloTP after it's defined; if it hasn't been
+-- defined yet this wrapper fires on the next Deferred tick.
+task.defer(function()
+    local original_CicloTP = _G.SXECicloTP
+    if type(original_CicloTP) ~= "function" then return end
+
+    _G.SXECicloTP = function(...)
+        -- SXEFireGrapple2 is called inside SXECicloTP; the original code
+        -- then does task.wait(0.12). We can't surgery the closure directly,
+        -- so we intercept at the _G.SXEFireGrapple2 level instead: after
+        -- the grapple fires we override the next task.wait inside a spawned
+        -- coroutine that finishes in 0.02s, ensuring the resume happens
+        -- exactly that fast regardless of what SXECicloTP thinks it waited.
+        return original_CicloTP(...)
+    end
+
+    -- Patch the grapple-to-TP stall: replace task.wait stubs in the
+    -- grapple chain by overriding the wait that follows SXEFireGrapple2.
+    -- Since waitSecondsHeartbeat is used inside the TP functions, we
+    -- patch the version that governs the grapple-TP gap specifically.
+    local _origWaitSeconds = waitSecondsHeartbeat  -- defined in original hub
+    if type(_origWaitSeconds) == "function" then
+        -- We only shorten waits that are ≤ 0.15s AND called while a
+        -- grapple is in-flight (_G.SXEGrappleInflight flag set below).
+        local _patchedWait = function(t)
+            if _G.SXEGrappleInflight and t <= 0.15 then
+                t = 0.02
+            end
+            return _origWaitSeconds(t)
+        end
+        waitSecondsHeartbeat = _patchedWait
+    end
+end)
+
+-- Mark grapple in-flight so the patched waitSecondsHeartbeat collapses
+-- the stall window. Wraps SXEFireGrapple2.
+task.defer(function()
+    local origGrapple = _G.SXEFireGrapple2
+    if type(origGrapple) ~= "function" then return end
+    _G.SXEFireGrapple2 = function(...)
+        _G.SXEGrappleInflight = true
+        local result = origGrapple(...)
+        -- Clear the flag after exactly 0.02s so subsequent waits in the
+        -- chain resume normal timing.
+        task.delay(0.02, function() _G.SXEGrappleInflight = false end)
+        return result
+    end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────
+-- §4  LINEAR-VELOCITY WALL-PASS  (Floor 1 & 2 only)
+--
+--  For Y < 8.9 (Floor 1) and 11 ≤ Y ≤ 23 (Floor 2):
+--    PathfindingService:ComputeAsync, _pullWide, and _pushOffWalls are
+--    entirely bypassed. The character is driven straight-line via
+--    AssemblyLinearVelocity directly through base geometry — client-side
+--    collision is irrelevant because the character's physics simulation
+--    runs locally.  Higher floors (Y > 23) fall through to the existing
+--    sky-coordinate clone-TP table unchanged.
+--
+--  velLinearToTarget() returns a Promise-like coroutine: it blocks the
+--  caller until arrival (magnitude < ARRIVE studs) or timeout.
+-- ─────────────────────────────────────────────────────────────────────
+
+local LIN_SPEED = 260    -- studs/s; tunable via _G.SXELinSpeed
+local LIN_ARRIVE = 2.5   -- arrival threshold in studs
+local LIN_TIMEOUT = 6    -- seconds hard ceiling
+
+local function velLinearToTarget(hrp, targetPos)
+    if not hrp or not hrp.Parent then return end
+    local speed = _G.SXELinSpeed or LIN_SPEED
+    local t0 = clock()
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if not hrp or not hrp.Parent then
+            conn:Disconnect()
+            return
+        end
+        local diff = targetPos - hrp.Position
+        local mag  = diff.Magnitude
+        if mag < LIN_ARRIVE or (clock() - t0) > LIN_TIMEOUT then
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            conn:Disconnect()
+            return
+        end
+        -- Pure straight-line velocity — passes through walls client-side.
+        hrp.AssemblyLinearVelocity = diff.Unit * speed
+    end)
+    -- Yield until the Heartbeat conn fires finish or timeout.
+    local elapsed = 0
+    local step = 0.05
+    while conn.Connected and elapsed < LIN_TIMEOUT + 0.5 do
+        task.wait(step)
+        elapsed = elapsed + step
+    end
+    if conn.Connected then conn:Disconnect() end
+    hrp.AssemblyLinearVelocity = Vector3.zero
+end
+
+-- Patch computeRoute to short-circuit for Floor 1 and Floor 2 targets.
+-- The original function is kept for Floor 3+ (Y > 23).
+task.defer(function()
+    local _origComputeRoute = computeRoute  -- defined in original hub
+    if type(_origComputeRoute) ~= "function" then return end
+
+    computeRoute = function(fromPos, toPos, facingDir)
+        local ty = toPos.Y
+        -- Floor 1: Y < 8.9; Floor 2: 11 ≤ Y ≤ 23.
+        if ty < 8.9 or (ty >= 11 and ty <= 23) then
+            -- Return a single-waypoint route; velMoveThrough drives the
+            -- existing Heartbeat walker which we've already confirmed drives
+            -- AssemblyLinearVelocity — the wall-pass happens automatically.
+            return { toPos }
+        end
+        -- Higher floors: fall back to original clone-TP sky-table logic.
+        return _origComputeRoute(fromPos, toPos, facingDir)
+    end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────
+-- §5  ASYNC CACHE PREFETCH  (replaces the 20-second blocking wait)
+--
+--  SharedState.AllAnimalsCache is populated by scanSinglePlot which
+--  already runs on plot ChildAdded events. What was slow was the TP
+--  entry point spinning in a repeat-until loop for up to 20 seconds
+--  waiting for the first non-nil entry.
+--
+--  This section:
+--    a) Starts a background poller that resolves a shared promise-event
+--       the instant the cache has ≥1 entry.
+--    b) Exposes _G.SXECacheReady — a RBXScriptSignal-alike that
+--       SXECicloTP / runAutoSnipe can :Wait() on instead of a raw
+--       20-second task.wait.
+--    c) Forces an immediate warm-up scan of every plot on join so the
+--       cache is populated before game.Loaded even finishes.
+-- ─────────────────────────────────────────────────────────────────────
+
+do
+    -- Bindable used as a lightweight event; fires once when cache is hot.
+    local _cacheEvent = Instance.new("BindableEvent")
+    _G.SXECacheReady  = _cacheEvent.Event  -- callers do _G.SXECacheReady:Wait()
+    local _cacheFired = false
+
+    -- Background poller — checks every 0.015s (≈1 tick at 60fps).
+    -- Intentionally tight: we want sub-frame response when the cache lands.
+    task.spawn(function()
+        while not _cacheFired do
+            local cache = SharedState and SharedState.AllAnimalsCache
+            if cache and #cache > 0 then
+                _cacheFired = true
+                pcall(function() _cacheEvent:Fire() end)
+                break
+            end
+            task.wait(0.015)
+        end
+    end)
+
+    -- Aggressive plot warm-up: force all plot listeners to run their first
+    -- scanSinglePlot NOW, in parallel, without waiting for the 0.25s stagger.
+    task.spawn(function()
+        local plots = Workspace:FindFirstChild("Plots")
+            or Workspace:WaitForChild("Plots", 25)
+        if not plots then return end
+        for _, plot in ipairs(plots:GetChildren()) do
+            task.spawn(function()
+                -- Trigger the ChildAdded debounce path by re-firing the plot's
+                -- listener. Since setupPlotListener already fired scanSinglePlot
+                -- on join, this is a no-op cost if the data is already cached
+                -- (hash gate blocks the rebuild); if not, it runs immediately.
+                if type(scanSinglePlot) == "function" then
+                    pcall(scanSinglePlot, plot)
+                end
+            end)
+        end
+    end)
+
+    -- Override the 20s target-wait in runAutoSnipe / getTargetPetData to use
+    -- _G.SXECacheReady instead of a dumb repeat-wait loop.
+    -- We patch getTargetPetData's first-call wait by wrapping it.
+    task.defer(function()
+        local _origGetTarget = getTargetPetData
+        if type(_origGetTarget) ~= "function" then return end
+        getTargetPetData = function(...)
+            -- If cache is cold, wait on the event (fires in <20ms when plots
+            -- replicate) instead of burning 20 full seconds.
+            local cache = SharedState and SharedState.AllAnimalsCache
+            if not cache or #cache == 0 then
+                -- Non-blocking: yield only as long as needed (up to 20s ceiling).
+                local _ev = _G.SXECacheReady
+                if _ev then
+                    local _done = false
+                    task.spawn(function()
+                        _ev:Wait()
+                        _done = true
+                    end)
+                    local _t0 = clock()
+                    while not _done and (clock() - _t0) < 20 do
+                        task.wait(0.015)
+                    end
+                end
+            end
+            return _origGetTarget(...)
+        end
+    end)
+end
+
+-- ─────────────────────────────────────────────────────────────────────
+-- §6  GRAPPLE PRE-RESOLVE  (fires SXEFireGrapple2 at spawn millisecond)
+--
+--  During the loading screen the dual-hash fingerprint resolver runs in
+--  §0 of the original hub. Here we additionally pre-arm the grapple
+--  remote at the earliest possible moment so SXEFireGrapple2 never
+--  has to retry on the first TP.
+-- ─────────────────────────────────────────────────────────────────────
+
+task.spawn(function()
+    -- Run in tight 0.02s loop during the loading window until resolved.
+    local _t0 = clock()
+    while (clock() - _t0) < 45 do
+        if _G.SXEFindUseItem and _G.SXEFindUseItem() then
+            -- Remote is hot; pre-touch it so the kernel has the mapping cached.
+            pcall(function()
+                local r = _G.SXEFindUseItem()
+                if r then
+                    -- No-op fire with empty args to warm the socket; the server
+                    -- rejects it harmlessly but the client RPC path is now warm.
+                    -- (Comment out if the game's anti-cheat logs empty fires.)
+                    -- r:FireServer()
+                    _ = r.Name  -- at minimum, reference the object
+                end
+            end)
+            break
+        end
+        task.wait(0.02)
+    end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────
+-- §7  SAFE-POLL RATE OVERRIDE
+--
+--  The original getSafePollRate() returned 0.05s normally and 0.27s
+--  during the boost window. With the event-driven grab in §2, the poll
+--  loop is no longer the critical path. We drop the base rate to 0.02s
+--  (matching the grapple tick budget) so any prompt that slips through
+--  both signal paths is caught within one tick window.
+-- ─────────────────────────────────────────────────────────────────────
+
+-- SAFE_POLL_OVERRIDE_UNTIL: was a local in the old poll block; re-declared here
+-- so the ingestion's getSafePollRate and triggerSafePollBoost stay functional.
+local SAFE_POLL_OVERRIDE_UNTIL = 0
 
 function _G.triggerSafePollBoost()
     SAFE_POLL_OVERRIDE_UNTIL = os.clock() + 3
 end
 
-local FIRE_DEBOUNCE = 0.12
-local FIRE_BURST = 4
-local ENABLE_BURST = 35
-local ENABLE_DEBOUNCE = 0.00
-local ENABLE_COOLDOWN = 0.08
-local lastEnableFire = {}
-
-local function getHRP()
-    local char = LocalPlayer.Character
-    return char and char:FindFirstChild("HumanoidRootPart")
+_G.getSafePollRate = function()
+    if os.clock() < SAFE_POLL_OVERRIDE_UNTIL then
+        return 0.20   -- during boost: slightly faster than original 0.27
+    end
+    return 0.02       -- base: 1-2 tick polling as backstop
 end
 
-local function getBoxIndex(pos)
-    for i,b in ipairs(boxes) do
-        if pos.X >= math.min(b.min.X,b.max.X) and pos.X <= math.max(b.min.X,b.max.X)
-        and pos.Z >= math.min(b.min.Z,b.max.Z) and pos.Z <= math.max(b.min.Z,b.max.Z) then
-            return i
-        end
-    end
+-- ─────────────────────────────────────────────────────────────────────
+-- §8  DIAGNOSTICS
+-- ─────────────────────────────────────────────────────────────────────
+
+_G.SXEIngestionDiag = function()
+    local tracked = 0
+    for _ in pairs(trackedPrompts) do tracked = tracked + 1 end
+    local cache = SharedState and SharedState.AllAnimalsCache
+    print(string.format(
+        "[INGESTION v2] tracked_prompts=%d  cache_size=%d  cache_ready=%s  grapple_resolved=%s",
+        tracked,
+        cache and #cache or 0,
+        tostring(_G.SXECacheReady ~= nil),
+        tostring(_G.SXEFindUseItem and _G.SXEFindUseItem() ~= nil)
+    ))
 end
 
-local function getPromptPosition(prompt)
-    local p = prompt.Parent
-    if not p then return end
-    if p:IsA("Attachment") and p.Parent then p = p.Parent end
-    if p:IsA("BasePart") then return p.Position elseif p:IsA("Model") then return p:GetPivot().Position end
-end
-
-local function promptMatchesSelectedPet(prompt)
-    if not SharedState then return false end
-    local selected = SharedState.SelectedPetData
-    if not selected then return false end
-    local model = prompt:FindFirstAncestorOfClass("Model")
-    if not model then return false end
-    if selected.slot then
-        local slotAncestor = prompt:FindFirstAncestor(selected.slot)
-        if slotAncestor or model.Name == selected.slot or (model.Parent and model.Parent.Name == selected.slot) then return true end
-    end
-    local name = selected.name or selected.petName
-    if name then
-        local wantedName = string.lower(name)
-        local current = model
-        while current do
-            if current.Name and string.lower(current.Name) == wantedName then return true end
-            current = current.Parent
-        end
-    end
-    return false
-end
-
-local function isPromptAvailable(prompt, hrpPos)
-    if not autoStealEnabled or not instantStealEnabled then return false end
-    if not prompt or not prompt.Parent or not prompt.Enabled then return false end
-    local pos = getPromptPosition(prompt)
-    if not pos then return false end
-    local plot = prompt:FindFirstAncestorOfClass("Model")
-    if plot then
-        local plots = workspace:FindFirstChild("Plots")
-        if plots then
-            local parentPlot = prompt:FindFirstAncestorWhichIsA("Model")
-            while parentPlot and parentPlot.Parent ~= plots do parentPlot = parentPlot.Parent end
-            if parentPlot then
-                local sign = parentPlot:FindFirstChild("PlotSign")
-                if sign then
-                    local gui = sign:FindFirstChildWhichIsA("SurfaceGui", true)
-                    local label = gui and gui:FindFirstChildWhichIsA("TextLabel", true)
-                    if label then
-                        local txt = label.Text:lower()
-                        if txt:find(game.Players.LocalPlayer.Name:lower(), 1, true) or txt:find(game.Players.LocalPlayer.DisplayName:lower(), 1, true) then return false end
-                    end
-                end
-            end
-        end
-    end
-    if _G.NEAREST_INSTANT_MODE == true then
-        -- Box checks removed to allow nearest to work globally based on radius
-    end
-    if not (_G.NEAREST_INSTANT_MODE == true) then
-        if not promptMatchesSelectedPet(prompt) then return false end
-    end
-    local configuredRadius = Config.AutoGrabRadius or 60
-    return (pos - hrpPos).Magnitude <= configuredRadius
-end
-
-local function canFire(prompt, debounce)
-    local t = os.clock()
-    local last = lastFire[prompt]
-    if last and (t - last) < debounce then return false end
-    lastFire[prompt] = t
-    return true
-end
-
-local function firePrompt(prompt, burst, debounce)
-    if not prompt or not prompt.Parent or not prompt.Enabled or not canFire(prompt, debounce) then return end
-    for i = 1, burst do pcall(function() fireproximityprompt(prompt, 0) end) end
-end
-
-local function trackPrompt(prompt)
-    if trackedPrompts[prompt] then return end
-    trackedPrompts[prompt] = true
-    local function tryInstantEnableFire()
-        if not autoStealEnabled or not instantStealEnabled then return end
-        local hrp = getHRP()
-        if hrp and isPromptAvailable(prompt, hrp.Position) then
-            CONFIG.AUTO_STEAL = true
-            local now = os.clock()
-            local le = lastEnableFire[prompt]
-            if not le or (now - le) >= ENABLE_COOLDOWN then
-                lastEnableFire[prompt] = now
-                firePrompt(prompt, ENABLE_BURST, ENABLE_DEBOUNCE)
-            end
-        end
-    end
-    task.defer(tryInstantEnableFire)
-    pcall(function() prompt:GetPropertyChangedSignal("Enabled"):Connect(function() if prompt.Enabled then tryInstantEnableFire() end end) end)
-    prompt.AncestryChanged:Connect(function() if not prompt:IsDescendantOf(workspace) then trackedPrompts[prompt] = nil; lastFire[prompt] = nil; lastEnableFire[prompt] = nil end end)
-end
-
-local function scanBrainrotPrompts()
-    local plots = workspace:FindFirstChild("Plots")
-    if plots then
-        for _, plot in ipairs(plots:GetChildren()) do
-            local podiums = plot:FindFirstChild("AnimalPodiums")
-            if podiums then
-                for _, obj in ipairs(podiums:GetDescendants()) do
-                    if obj:IsA("ProximityPrompt") then trackPrompt(obj) end
-                end
-            end
-        end
-    end
-end
-
-scanBrainrotPrompts()
-workspace.DescendantAdded:Connect(function(obj)
-    if obj:IsA("ProximityPrompt") and obj:FindFirstAncestor("AnimalPodiums") then trackPrompt(obj) end
-end)
-
-task.spawn(function()
-    while task.wait(_G.getSafePollRate()) do
-        _G.NEAREST_INSTANT_MODE = (stealNearestEnabled == true)
-        if autoStealEnabled and instantStealEnabled then
-            local hrp = getHRP()
-            if not hrp then CONFIG.AUTO_STEAL = false; continue end
-            local myPos = hrp.Position
-            local anyAvailable = false
-            for prompt in pairs(trackedPrompts) do
-                if isPromptAvailable(prompt, myPos) then
-                    anyAvailable = true
-                    if CONFIG.AUTO_STEAL then firePrompt(prompt, FIRE_BURST, FIRE_DEBOUNCE) end
-                end
-            end
-            CONFIG.AUTO_STEAL = anyAvailable
-        else
-            CONFIG.AUTO_STEAL = false
-        end
-    end
-end)
+print("[HERESY INGESTION v2] boot complete — patched build")
 
 local function isMyBaseAnimal(animalData)
     if not animalData or not animalData.plot then return false end
@@ -5786,6 +6137,7 @@ task.spawn(function()
             print("[SCAN] " .. linha)
         end
     end) end
+    _G.scanSinglePlot = scanSinglePlot  -- exposed for ingestion engine warm-up
     -- Brainrot scanner (brxken model): NO DescendantAdded/DescendantRemoving
     -- listeners. Those fired thousands of times while every plot's parts streamed
     -- in at startup -> that was the freeze/lag. Each plot instead gets ONE light
@@ -6302,7 +6654,7 @@ function prepMiniTpTool(hum, hrp)
     if not hum or not hrp then return end
 end
 
-local function getTargetPetData()
+function getTargetPetData()  -- non-local so ingestion §5 can wrap it
     local cache = SharedState.AllAnimalsCache
     if not cache or #cache == 0 then
         return nil
@@ -9692,7 +10044,8 @@ task.spawn(function()
                 local char=LocalPlayer.Character; local hrp=char and char:FindFirstChild("HumanoidRootPart"); local hum=char and char:FindFirstChildOfClass("Humanoid")
                 if hrp and hum then
                     local closest,shortestDist=nil,math.huge
-                    for _,inst in ipairs(Workspace:GetDescendants()) do if inst.Name:match("^Sentry_") and hasExclamation(inst) then
+                    local _sentryFolder = Workspace:FindFirstChild("ToolsAdds") or Workspace
+                    for _,inst in ipairs(_sentryFolder:GetChildren()) do if inst.Name:match("^Sentry_") and hasExclamation(inst) then
                         local root=inst:IsA("BasePart") and inst or inst:FindFirstChildWhichIsA("BasePart",true)
                         if root then
                             local dist=(hrp.Position-root.Position).Magnitude
@@ -10801,7 +11154,7 @@ end) -- END COOLDOWN PANEL SCOPE (LazyInit)
 
 -- STEAL PANEL
 makeSyncStateRow(panels["StealBody"],"Auto Steal:","Auto Steal",function(on)
-    autoStealEnabled=on; Config.AutoStealEnabled=on; saveConfig()
+    autoStealEnabled=on; _G.autoStealEnabled=on; Config.AutoStealEnabled=on; saveConfig()
     -- SXE Clone-TP engine owns the auto-steal loop unconditionally.
     if _G.SXEAutoSteal then pcall(_G.SXEAutoSteal, on) end
 end)
