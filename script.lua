@@ -7619,13 +7619,13 @@ function _routeClear(pts)
     return true
 end
 
-local function _peakY(pts)
+function _peakY(pts)
     local m = -math.huge
     for _, p in ipairs(pts) do if p.Y > m then m = p.Y end end
     return m
 end
 
-local function _starts(fromPos)
+function _starts(fromPos)
     local pts = { fromPos }
     if _block(fromPos, fromPos + Vector3.new(0, 40, 0)) then
         for _, dr in ipairs(_DIRS) do
@@ -7636,7 +7636,7 @@ local function _starts(fromPos)
     return pts
 end
 
-local function _candidates(sp, stage, toPos)
+function _candidates(sp, stage, toPos)
     local list = {}
     local function add(mid)
         if mid then list[#list + 1] = { sp, mid, stage, toPos }
@@ -7659,7 +7659,7 @@ end
 local PathfindingService = game:GetService("PathfindingService")
 local _CLEARANCE = 6
 
-local function _clearWide(a, b)
+function _clearWide(a, b)
     if not _clear(a, b) then return false end
     local d = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
     if d.Magnitude < 0.1 then return true end
@@ -7667,7 +7667,7 @@ local function _clearWide(a, b)
     return _clear(a + p, b + p) and _clear(a - p, b - p)
 end
 
-local function _pullWide(pts)
+function _pullWide(pts)
     if #pts <= 2 then return pts end
     local out = { pts[1] }
     local i = 1
@@ -7759,7 +7759,7 @@ local cloneref = cloneref or function(o) return o end
 local getinfo = debug.getinfo or getinfo
 local lp = cloneref(game:GetService("Players")).LocalPlayer
 
-local function Strip()
+function Strip()
     local char = lp.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
