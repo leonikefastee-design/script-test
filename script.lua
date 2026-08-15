@@ -7656,8 +7656,8 @@ function _candidates(sp, stage, toPos)
     return list
 end
 
-local PathfindingService = game:GetService("PathfindingService")
-local _CLEARANCE = 6
+PathfindingService = game:GetService("PathfindingService")
+_CLEARANCE = 6
 
 function _clearWide(a, b)
     if not _clear(a, b) then return false end
